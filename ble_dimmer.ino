@@ -26,7 +26,7 @@
 const byte devType = DIMMER;
 
 // undefine for release
-#define __DEBUG__
+//#define __DEBUG__
 
 /* data type */
 #define TYPE_RAW         0x01
@@ -226,7 +226,6 @@ inline byte bleDimmingLinear(byte x, int8_t a, byte da, int8_t b, byte db, int8_
  */
 typedef struct {
 	byte   port;
-	byte   duration; // duration * 10 = 1 seconds
 	int8_t  a;       // coefficient. signed byte
 	uint8_t da;      // divider for coefficient
 	int8_t  b;
@@ -234,13 +233,15 @@ typedef struct {
 	int8_t  c;       // last constant doesn't need divider
 } dimValue;
 
-/* Payload (data) 
+/* duration * 10 = 1 seconds
+ *
+ * Payload (data) 
  * .-----------------------------------------.
  * | dimValue1 | dimValue2 | ... | dimValueN |
  * |-----------+-----------+-----+-----------|
- * |         7 |         7 | ... |         7 |
+ * |         6 |         6 | ... |         6 |
  * '-----------------------------------------'
- * N is up to 2 ( (BLE_DATA_MAX-2) / sizeof(dimValue) )
+ * N is up to 3 ( (BLE_DATA_MAX-2) / sizeof(dimValue) )
  * duration is transition time
  * if function is y = -1/128x^2 + 2x, you can set
  * (ca, da) = (-1, 128)
@@ -249,14 +250,15 @@ typedef struct {
  *
  * NOTE: this funtion use busy loop
  */
-void bleDimming(byte *data, byte sz)
+void bleDimming1(const byte *data, const byte sz, const byte duration)
 {
-	byte dimSize   = sizeof(dimValue);
-	byte y         = 0;
-	dimValue *dv   = NULL;
-	uint16_t delta = 0;
+	const byte dimSize = sizeof(dimValue);
+	const byte delta   = duration*100 / dimRange;
+	dimValue *dv = NULL;
+	byte y       = 0;
 
 	// sanity check
+	if (duration > dimRange)      { return; }
 	if (sz < dimSize)             { return; }
 	if ((sz % dimSize) != 0)      { return; }
 	if ((sz / dimSize) > nOutlet) { return; }
@@ -264,25 +266,24 @@ void bleDimming(byte *data, byte sz)
 
 	dumpPkt(data, sz);
 
-	for (int i=0; i<sz; i+=dimSize)
+	for (int i=0; i<dimRange; i++)
 	{
-		dv = (dimValue *)(data + i);
-
-		if (dv->duration > dimRange) { continue; }
-		if (dv->port == 0)           { continue; }
-		dv->port--;
-
-		syslog("LED %d(%dpin) Duration(%d) y=(%d/%d)x^2 + (%d/%d)x + (%d)",
-				dv->port, outlet[dv->port], dv->duration, 
-				dv->a, dv->da, dv->b, dv->db, dv->c);
-
-		delta = dv->duration*100 / dimRange;
-		for (int i=0; i<dimRange; i++)
+		for (int j=0; j<sz; j+=dimSize)
 		{
+			dv = (dimValue *)(data + j);
+			if (dv->port == 0) { continue; }
+
+			if (i == 0)
+			{
+				syslog("LED %d(%dpin) for (%d/10)s [y=(%d/%d)x^2 + (%d/%d)x + (%d)]",
+						(dv->port-1), outlet[(dv->port-1)], duration, 
+						dv->a, dv->da, dv->b, dv->db, dv->c);
+			}
+
 			y = bleDimmingLinear(i, dv->a, dv->da, dv->b, dv->db, dv->c);
-			dimming[dv->port] = dimRange - y;
-			delay(delta);
+			dimming[(dv->port-1)] = dimRange - y;
 		}
+		delay(delta);
 	}
 }
 
@@ -321,7 +322,8 @@ void bleParser(const byte* buffer, size_t size)
 			bleRaw(datagram + 2, sz - 2);
 			break;
 		case TYPE_DIMMING1:
-			bleDimming(datagram + 2, sz - 2);
+			if (sz < 3) { break; }
+			bleDimming1(datagram + 3, sz - 3, *(datagram + 2));
 			break;
 		default:
 			break;
@@ -353,18 +355,18 @@ void debug_dimmer()
 	// continuous dimming
 #if 0
 	// y = x
-	dimValue dv1 = {1, 50, 0, 1, 1, 1, 0};
-	bleDimming((byte*)&dv1, sizeof(dimValue));
+	dimValue dv1 = {1, 0, 1, 1, 1, 0};
+	bleDimming1((byte*)&dv1, sizeof(dimValue), 50);
 #endif
 #if 0
 	// y = 1/128x^2
-	dimValue dv2 = {1, 50, 1, 128, 0, 1, 0};
-	bleDimming((byte*)&dv2, sizeof(dimValue));
+	dimValue dv2 = {1, 1, 128, 0, 1, 0};
+	bleDimming1((byte*)&dv2, sizeof(dimValue), 50);
 #endif
 #if 0
 	// y = -1/128x^2 + 2x
-	dimValue dv3 = {1, 50, -1, 128, 2, 1, 0};
-	bleDimming((byte*)&dv3, sizeof(dimValue));
+	dimValue dv3 = {1, -1, 128, 2, 1, 0};
+	bleDimming1((byte*)&dv3, sizeof(dimValue), 50);
 #endif
 }
 
