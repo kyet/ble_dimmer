@@ -10,48 +10,53 @@
 
 #include <stdarg.h>
 #include <TimerOne.h>
-//#include <SoftwareSerial.h>
-//#include <PacketSerial.h>
+#include <SoftwareSerial.h>
+#include <PacketSerial.h>
 
-// Device type
-//#define SWITCH
-#define DIMMING
+/* Device type */
+#define SWITCH       0x01
+#define DIMMER       0x02
+const byte devType = DIMMER;
 
 // Undefine for release
 #define __DEBUG__
 
-#define BLE_DATA_MAX 20
-
+/* Data type */
 #define TYPE_RAW     0x01
 #define TYPE_DIMMING 0x02
-
-#define TYPE_UNDEF3  0x40
-#define TYPE_UNDEF2  0x80
-#define TYPE_UNDEF1  0xFF
+#define TYPE_UNDEF6  0x04
+#define TYPE_UNDEF5  0x08
+#define TYPE_UNDEF4  0x10
+#define TYPE_UNDEF3  0x20
+#define TYPE_UNDEF2  0x40
+#define TYPE_UNDEF1  0x80
 
 /* For dimmer */
-//#define DIM_RANGE      256
-//#define DIM_RANGE        128
 #define ZERO_CROSS_INT   0   // For zero crossing detect (int0 is pin 2)
 #define HZ               60  // 60 for the most America, Korea, Taiwan, Phillippines
                              // 50 for China, Europe, Japan, and rest of.
 
-//SoftwareSerial bleSerial(10, 11); // Rx, Tx (Connect reverse order)
-//PacketSerial   pktSerial;
+/* For Bluetooth */
+#define BLE_RX        10     // Serial pin: connect reverse order
+#define BLE_TX        11
+#define BLE_DATA_MAX  20     // Payload size
 
-const int outlet[] = {3, 5};
-const int nOutlet  = sizeof(outlet) / sizeof(outlet[0]);
+/* Outlet pin */
+const byte outlet[] = {3, 5};
+const byte nOutlet  = sizeof(outlet) / sizeof(outlet[0]);
 
 /* For dimmer */
 /* NOTE: sec to us, hertz to frequency, half cycle
  * Approx. 8,333us for 60Hz. 10,000us for 50Hz.
  */
-const unsigned int range = 128;
-//const unsigned int period = ((1000 * 1000) / HZ) / 2 / range; // FIXME: this set to 0.. 
-const unsigned int period = 65;
-
+const byte range  = 128;
+const byte period = (byte)((1000.0 * 1000.0) / (HZ * 2 * range));
 // The time to idle low on the outlet[]
-volatile uint8_t dimming[nOutlet] = {0};
+volatile byte dimming[nOutlet] = {0};
+volatile byte crossing = 0;
+
+SoftwareSerial bleSerial(BLE_RX, BLE_TX);
+PacketSerial   pktSerial;
 
 void setup() 
 {
@@ -66,23 +71,20 @@ void setup()
 		pinMode(outlet[i], OUTPUT);
 	}
 
-#if 0
 	bleSerial.begin(9600);
 
 	pktSerial.setPacketHandler(&bleParser);
 	pktSerial.begin(&bleSerial);
-#endif
 
-#if defined(DIMMING)
-	pinMode(ZERO_CROSS_INT, INPUT);
-	attachInterrupt(ZERO_CROSS_INT, zeroCrossInt, RISING);  
-	Timer1.initialize();
-	Timer1.attachInterrupt(triggerTriac, period);
-#endif
-
+	if (devType == DIMMER)
+	{
+		pinMode(ZERO_CROSS_INT, INPUT);
+		attachInterrupt(ZERO_CROSS_INT, zeroCrossInt, RISING);  
+		Timer1.initialize();
+		Timer1.attachInterrupt(triggerTriac, period);
+	}
 }
 
-volatile uint8_t crossing = 0;
 void zeroCrossInt()
 {
 	crossing = 1;
@@ -93,11 +95,11 @@ void zeroCrossInt()
  */
 void triggerTriac()
 {
-	static uint8_t cnt = 0;
+	static byte cnt = 0;
 
 	if (crossing)
 	{
-		if (cnt == (range-dimming[0]))
+		if (cnt++ == dimming[0])
 		{
 			digitalWrite(outlet[0], HIGH);
 			delayMicroseconds(10);  // triac switching delay
@@ -106,17 +108,16 @@ void triggerTriac()
 			crossing = 0;
 			cnt = 0;
 		}
-		cnt++;
 	}
 }
 
 // Event handler
 typedef struct _portValue {
-	uint8_t port;
-	uint8_t value;
+	byte port;
+	byte value;
 } portValue;
 
-void bleRaw(uint8_t *data, uint8_t sz)
+void bleRaw(byte *data, byte sz)
 {
 	portValue *pv = NULL;
 
@@ -134,37 +135,41 @@ void bleRaw(uint8_t *data, uint8_t sz)
 		if (pv->port == 0) { continue; }
 		pv->port--;
 
-#if defined(SWITCH)
-		if (pv->value >= 0x80)
+		if (devType == SWITCH)
 		{
-			digitalWrite(outlet[pv->port], HIGH);
-			syslog("LED %d(%dpin) ON(0x%02X)", 
-					pv->port, outlet[pv->port], pv->value);
+			if (pv->value >= 0x80)
+			{
+				digitalWrite(outlet[pv->port], HIGH);
+				syslog("LED %d(%dpin) ON(0x%02X)", 
+						pv->port, outlet[pv->port], pv->value);
+			}
+			else
+			{
+				digitalWrite(outlet[pv->port], LOW);
+				syslog("LED %d(%dpin) OFF(0x%02X)",
+						pv->port, outlet[pv->port], pv->value);
+			}
 		}
 		else
 		{
-			digitalWrite(outlet[pv->port], LOW);
-			syslog("LED %d(%dpin) OFF(0x%02X)",
+			// FIXME
+			//AnalogWrite(outlet[pv->port], pv->value);
+			syslog("LED %d(%dpin) Value(0x%02X)",
 					pv->port, outlet[pv->port], pv->value);
 		}
-#else
-		//AnalogWrite(outlet[pv->port], pv->value);
-		syslog("LED %d(%dpin) Value(0x%02X)",
-				pv->port, outlet[pv->port], pv->value);
-#endif
 	}
 }
 
-void bleDimming(uint8_t *data, uint8_t sz)
+void bleDimming(byte *data, byte sz)
 {
 	
 	
 }
 
-void bleParser(const uint8_t* buffer, size_t size)
+void bleParser(const byte* buffer, size_t size)
 {
-	uint8_t datagram[BLE_DATA_MAX] = {0};
-	uint8_t type, sz;
+	byte datagram[BLE_DATA_MAX] = {0};
+	byte type, sz;
 	char buf[128];
 
 	if (buffer == NULL)
@@ -198,17 +203,19 @@ void bleParser(const uint8_t* buffer, size_t size)
 
 void loop() 
 {
-	//pktSerial.update();
+#if 0
+	pktSerial.update();
+#endif
 	 
 	// available range: 10 ~ 124
-	for (int i=10; i<=(range-10); i+=1)
+	for (byte i=10; i<=(range-10); i+=1)
 	{
-		dimming[0] = i;
+		dimming[0] = (range-i);
 		delay(30);
 	}
 }
 
-void dumpPkt(const uint8_t* packet, size_t size)
+void dumpPkt(const byte* packet, size_t size)
 {
 #if defined(__DEBUG__)
 	char buf[10] = "";
