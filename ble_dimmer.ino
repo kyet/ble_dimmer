@@ -13,15 +13,15 @@
 #include <SoftwareSerial.h>
 #include <PacketSerial.h>
 
-/* Device type */
+/* device type */
 #define SWITCH       0x01
 #define DIMMER       0x02
 const byte devType = DIMMER;
 
-// Undefine for release
-#define __DEBUG__
+// undefine for release
+//#define __DEBUG__
 
-/* Data type */
+/* data type */
 #define TYPE_RAW     0x01
 #define TYPE_DIMMING 0x02
 #define TYPE_UNDEF6  0x04
@@ -31,29 +31,37 @@ const byte devType = DIMMER;
 #define TYPE_UNDEF2  0x40
 #define TYPE_UNDEF1  0x80
 
-/* For dimmer */
-#define ZERO_CROSS_INT   0   // For zero crossing detect (int0 is pin 2)
+/* for dimmer */
+#define ZERO_CROSS_INT   0   // for zero crossing detect (int0 is pin 2)
 #define HZ               60  // 60 for the most America, Korea, Taiwan, Phillippines
                              // 50 for China, Europe, Japan, and rest of.
+#define FUNC_LINEAR  0x01
 
-/* For Bluetooth */
-#define BLE_RX        10     // Serial pin: connect reverse order
+/* for bluetooth */
+#define BLE_RX        10     // serial pin: connect reverse order
 #define BLE_TX        11
-#define BLE_DATA_MAX  20     // Payload size
+#define BLE_DATA_MAX  20     // payload size
 
-/* Outlet pin */
+/* outlet pin */
 const byte outlet[] = {3, 5};
 const byte nOutlet  = sizeof(outlet) / sizeof(outlet[0]);
 
-/* For dimmer */
-/* NOTE: sec to us, hertz to frequency, half cycle
- * Approx. 8,333us for 60Hz. 10,000us for 50Hz.
+/* for dimmer */
+/* NOTE: calcuation of dimPeriod.
+ *       sec to us, hertz to frequency, half cycle, range
+ *       zero crossing period: 8,333us for 60Hz. 10,000us for 50Hz.
+ *       dimPeriod when dimRange is 128: 65 for 60Hz, 78 for 50Hz. 
+ *       dimPeriod when dimRange is 258: 32 for 60Hz, 39 for 50Hz. 
+ * NOTE: When dim range is 128, below 10 and avobe 124 not works in experimental. 
+ *       So we use threshold low and high.
  */
-const byte range  = 128;
-const byte period = (byte)((1000.0 * 1000.0) / (HZ * 2 * range));
-// The time to idle low on the outlet[]
-volatile byte dimming[nOutlet] = {0};
-volatile byte crossing = 0;
+const byte dimRange  = 128;                 // greater than 128 may not work
+const byte thresLow  = dimRange >> 3;       // approximately 10% of dimRange
+const byte thresHigh = dimRange - thresLow; // approximately 90% of dimRange
+const byte dimPeriod = (byte)((1000.0 * 1000.0) / (HZ * 2 * dimRange));
+volatile byte dimming[nOutlet]  = {0}; // the time to idle low on the outlet[]
+volatile byte crossing[nOutlet] = {0}; // zero-crossing event
+volatile byte trigCnt = 0;
 
 SoftwareSerial bleSerial(BLE_RX, BLE_TX);
 PacketSerial   pktSerial;
@@ -62,8 +70,8 @@ void setup()
 {
 	Serial.begin(9600);
 
-	// Wait for serial port to connect
-	// Needed for native USB port only
+	// wait for serial port to connect
+	// needed for native USB port only
 	while (!Serial) { ; }
 
 	for (int i=0; i<nOutlet; i++)
@@ -81,91 +89,211 @@ void setup()
 		pinMode(ZERO_CROSS_INT, INPUT);
 		attachInterrupt(ZERO_CROSS_INT, zeroCrossInt, RISING);  
 		Timer1.initialize();
-		Timer1.attachInterrupt(triggerTriac, period);
+		Timer1.attachInterrupt(triggerTriac, dimPeriod);
 	}
 }
 
 void zeroCrossInt()
 {
-	crossing = 1;
+	// set event flag
+	for (int i=0; i<nOutlet; i++)
+	{
+		if (dimming[i] < thresLow)
+		{
+			digitalWrite(outlet[i], LOW);
+			crossing[i] = 0;
+		}
+		else if (dimming[i] > thresHigh)
+		{
+			digitalWrite(outlet[i], HIGH);
+			crossing[i] = 0;
+		}
+		else
+		{
+			crossing[i] = 1;
+		}
+	}
+
+	// reset count
+	trigCnt = 0;
 }
 
 /* NOTE: Do not use delay() in interrupt. It depends on interrupt itself.
- * Instead, use delayMicroseconds() that run busy loop(NOP).
+ *       Instead, use delayMicroseconds() that run busy loop(NOP).
  */
 void triggerTriac()
 {
-	static byte cnt = 0;
-
-	if (crossing)
+	for (int i=0; i<nOutlet; i++)
 	{
-		if (cnt++ == dimming[0])
+		if (crossing[i] && (trigCnt == dimming[i]))
 		{
-			digitalWrite(outlet[0], HIGH);
-			delayMicroseconds(10);  // triac switching delay
-			digitalWrite(outlet[0], LOW);
+			digitalWrite(outlet[i], HIGH);
+			delayMicroseconds(10);  // propagation delay
+			digitalWrite(outlet[i], LOW);
 
-			crossing = 0;
-			cnt = 0;
+			crossing[i] = 0;        // reset event flag
 		}
 	}
+
+	trigCnt++;
 }
 
-// Event handler
-typedef struct _portValue {
+// event handler
+typedef struct {
 	byte port;
 	byte value;
-} portValue;
+} rawValue;
 
+/* Payload (data) 
+ * .----------------------------------------.
+ * | rawValue1 | rawVale2 | ... | rawValueN |
+ * |-----------+----------+-----+-----------|
+ * |         2 |        2 | ... |         2 |
+ * '----------------------------------------'
+ * N is up to 9 ( (BLE_DATA_MAX-2) / sizeof(rawValue) )
+ */
 void bleRaw(byte *data, byte sz)
 {
-	portValue *pv = NULL;
+	byte rvSize  = sizeof(rawValue);
+	rawValue *rv = NULL;
 
-	// Sanity check
-	if (sz < 2)             { return; }
-	if ((sz % 2) != 0)      { return; }
-	if ((sz / 2) > nOutlet) { return; }
+	// sanity check
+	if (sz < rvSize)             { return; }
+	if ((sz % rvSize) != 0)      { return; }
+	if ((sz / rvSize) > nOutlet) { return; }
 
 	dumpPkt(data, sz);
 
-	for (int i=0; i<sz; i+=2)
+	for (int i=0; i<sz; i+=rvSize)
 	{
-		pv = (portValue *)(data + i);
+		rv = (rawValue *)(data + i);
 
-		if (pv->port == 0) { continue; }
-		pv->port--;
+		if (rv->port == 0) { continue; }
+		rv->port--;
 
 		if (devType == SWITCH)
 		{
-			if (pv->value >= 0x80)
+			if (rv->value >= 0x80)
 			{
-				digitalWrite(outlet[pv->port], HIGH);
+				digitalWrite(outlet[rv->port], HIGH);
 				syslog("LED %d(%dpin) ON(0x%02X)", 
-						pv->port, outlet[pv->port], pv->value);
+						rv->port, outlet[rv->port], rv->value);
 			}
 			else
 			{
-				digitalWrite(outlet[pv->port], LOW);
+				digitalWrite(outlet[rv->port], LOW);
 				syslog("LED %d(%dpin) OFF(0x%02X)",
-						pv->port, outlet[pv->port], pv->value);
+						rv->port, outlet[rv->port], rv->value);
 			}
 		}
 		else
 		{
-			// FIXME
-			//AnalogWrite(outlet[pv->port], pv->value);
+			dimming[rv->port] = (dimRange - rv->value);
 			syslog("LED %d(%dpin) Value(0x%02X)",
-					pv->port, outlet[pv->port], pv->value);
+					rv->port, outlet[rv->port], rv->value);
 		}
 	}
 }
 
-void bleDimming(byte *data, byte sz)
+// y = ax^2 + bx + c
+inline byte bleDimmingLinear(byte x, 
+		int8_t a, byte da, 
+		int8_t b, byte db, 
+		int8_t c, byte dc)
 {
+	int y = 0;
 	
-	
+	// prevent divide by zero
+	if (da == 0) { da = 1; }
+	if (db == 0) { db = 1; }
+	if (dc == 0) { dc = 1; }
+
+	y = a*x*x/da + b*x/db + c/dc;
+
+	if (y > dimRange) { return dimRange; }
+	else if (y < 0)   { return 0; }
+
+	return y;
 }
 
+typedef struct {
+	byte   port;
+	byte   duration; // duration * 10 = 1 seconds
+	byte   function;
+	int8_t  a;       // coefficient. signed byte
+	uint8_t da;       // divider for coefficient
+	int8_t  b;
+	uint8_t db;
+	int8_t  c;
+	uint8_t dc;
+} dimValue;
+
+/* Payload (data) 
+ * .-----------------------------------------.
+ * | dimValue1 | dimValue2 | ... | dimValueN |
+ * |-----------+-----------+-----+-----------|
+ * |         9 |         9 | ... |         9 |
+ * '-----------------------------------------'
+ * N is up to 2 ( (BLE_DATA_MAX-2) / sizeof(dimValue) )
+ * duration is transition time
+ * if function is y = -1/128x^2 + 2x, you can set
+ * (ca, da) = (-1, 128)
+ * (cb, db) = ( 2,   1)
+ * (cc, dc) = ( 0,   1)
+ *
+ * NOTE: this funtion use busy loop
+ */
+void bleDimming(byte *data, byte sz)
+{
+	byte dimSize   = sizeof(dimValue);
+	byte y         = 0;
+	dimValue *dv   = NULL;
+	uint16_t delta = 0;
+
+	// sanity check
+	if (sz < dimSize)             { return; }
+	if ((sz % dimSize) != 0)      { return; }
+	if ((sz / dimSize) > nOutlet) { return; }
+	if (devType != DIMMER)        { return; }
+
+	dumpPkt(data, sz);
+
+	for (int i=0; i<sz; i+=dimSize)
+	{
+		dv = (dimValue *)(data + i);
+
+		if (dv->duration > dimRange) { continue; }
+		if (dv->port == 0)           { continue; }
+		dv->port--;
+
+		syslog("LED %d(%dpin) Duration(%d) y=(%d/%d)x^2 + (%d/%d)x + (%d/%d)",
+				dv->port, outlet[dv->port], dv->duration, 
+				dv->a, dv->da, dv->b, dv->db, dv->c, dv->dc);
+
+		delta = dv->duration*100 / dimRange;
+		for (int i=0; i<dimRange; i++)
+		{
+			if (dv->function == FUNC_LINEAR)
+				y = bleDimmingLinear(i, 
+						dv->a, dv->da, 
+						dv->b, dv->db,
+						dv->c, dv->dc);
+			else
+				y = 0;
+
+			dimming[dv->port] = dimRange - y;
+			delay(delta);
+		}
+	}
+}
+
+/* Datagram (buffer)
+   .----------------------------------.
+   | Type | Length | Payload          |
+   |------+--------+------------------|
+   |    1 |      1 | BLE_DATA_MAX - 2 |
+   '----------------------------------'
+*/
 void bleParser(const byte* buffer, size_t size)
 {
 	byte datagram[BLE_DATA_MAX] = {0};
@@ -181,7 +309,7 @@ void bleParser(const byte* buffer, size_t size)
 	dumpPkt(buffer, size);
 	memcpy(datagram, buffer, size); 
 
-	// Parse header
+	// parse header
 	type = datagram[0];
 	sz   = datagram[1];
 
@@ -201,18 +329,55 @@ void bleParser(const byte* buffer, size_t size)
 	}
 }
 
+void debug_dimmer()
+{
+	// fixed dimming
+#if 0
+	// 0%
+	rawValue rv0 = {1, 0};
+	bleRaw((byte*)&rv0, sizeof(rawValue));
+	delay(3000);
+#endif
+#if 0
+	// 50%
+	rawValue rv50 = {1, 64};
+	bleRaw((byte*)&rv50, sizeof(rawValue));
+	delay(3000);
+#endif
+#if 0
+	// 100%
+	rawValue rv100 = {1, 128};
+	bleRaw((byte*)&rv100, sizeof(rawValue));
+	delay(3000);
+#endif
+
+	// continuous dimming
+#if 1
+	// y = x
+	dimValue dv1 = {1, 50, FUNC_LINEAR, 0, 1, 1, 1, 0, 1};
+	bleDimming((byte*)&dv1, sizeof(dimValue));
+#endif
+#if 0
+	// y = 1/128x^2
+	dimValue dv2 = {1, 50, FUNC_LINEAR, 1, 128, 0, 1, 0, 1};
+	bleDimming((byte*)&dv2, sizeof(dimValue));
+#endif
+#if 0
+	// y = -1/128x^2 + 2x
+	dimValue dv3 = {1, 50, FUNC_LINEAR, -1, 128, 2, 1, 0, 1};
+	bleDimming((byte*)&dv3, sizeof(dimValue));
+#endif
+}
+
 void loop() 
 {
 #if 0
 	pktSerial.update();
 #endif
 	 
-	// available range: 10 ~ 124
-	for (byte i=10; i<=(range-10); i+=1)
-	{
-		dimming[0] = (range-i);
-		delay(30);
-	}
+#if defined(__DEBUG__)
+	debug_dimmer();
+#endif
 }
 
 void dumpPkt(const byte* packet, size_t size)
