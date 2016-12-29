@@ -10,8 +10,8 @@
 
 #include <stdarg.h>
 #include <TimerOne.h>
-#include <SoftwareSerial.h>
-#include <PacketSerial.h>
+//#include <SoftwareSerial.h>
+//#include <PacketSerial.h>
 
 // Device type
 //#define SWITCH
@@ -29,9 +29,9 @@
 #define TYPE_UNDEF2  0x80
 #define TYPE_UNDEF1  0xFF
 
-// for dimmer
+/* For dimmer */
 //#define DIM_RANGE      256
-#define DIM_RANGE        128
+//#define DIM_RANGE        128
 #define ZERO_CROSS_INT   0   // For zero crossing detect (int0 is pin 2)
 #define HZ               60  // 60 for the most America, Korea, Taiwan, Phillippines
                              // 50 for China, Europe, Japan, and rest of.
@@ -39,19 +39,19 @@
 //SoftwareSerial bleSerial(10, 11); // Rx, Tx (Connect reverse order)
 //PacketSerial   pktSerial;
 
-//const int outlet[] = {2, 4, 7, 8, 12, 13};
-//const int outlet[] = {3, 5, 6, 9};
-//const int outlet[] = {3, 5};
 const int outlet[] = {3, 5};
-const int nOutlet = sizeof(outlet) / sizeof(outlet[0]);
+const int nOutlet  = sizeof(outlet) / sizeof(outlet[0]);
 
-// For dimmer
-// Approx. 8,333us for 60Hz. 10,000us for 50Hz.
-// sec to us, hertz to frequency, half cycle
-const unsigned int period = 1000 * 1000 / HZ / 2;
+/* For dimmer */
+/* NOTE: sec to us, hertz to frequency, half cycle
+ * Approx. 8,333us for 60Hz. 10,000us for 50Hz.
+ */
+const unsigned int range = 128;
+//const unsigned int period = ((1000 * 1000) / HZ) / 2 / range; // FIXME: this set to 0.. 
+const unsigned int period = 65;
 
-// The time to idle low on the outelt[]
-volatile unsigned int dimming[nOutlet] = {0}; // FIXME: change to byte after adjust range 
+// The time to idle low on the outlet[]
+volatile uint8_t dimming[nOutlet] = {0};
 
 void setup() 
 {
@@ -66,89 +66,47 @@ void setup()
 		pinMode(outlet[i], OUTPUT);
 	}
 
-//	bleSerial.begin(9600);
-//
-//	pktSerial.setPacketHandler(&bleParser);
-//	pktSerial.begin(&bleSerial);
+#if 0
+	bleSerial.begin(9600);
+
+	pktSerial.setPacketHandler(&bleParser);
+	pktSerial.begin(&bleSerial);
+#endif
 
 #if defined(DIMMING)
 	pinMode(ZERO_CROSS_INT, INPUT);
 	attachInterrupt(ZERO_CROSS_INT, zeroCrossInt, RISING);  
+	Timer1.initialize();
+	Timer1.attachInterrupt(triggerTriac, period);
 #endif
 
-	Timer1.attachInterrupt(triggerTriac, period/256);
 }
 
-volatile byte crossing = 0;
-//int dim = 0;
+volatile uint8_t crossing = 0;
 void zeroCrossInt()
 {
-//	digitalWrite(outlet[0], LOW);
-//	Timer1.restart();
-//	Timer1.attachInterrupt(triggerTriac, dimming[0]);
-
 	crossing = 1;
-#if 0
-	if (dimming[0] <= 100)
-		digitalWrite(outlet[0], LOW);
-	else if (dimming[0] >= 8000)
-		digitalWrite(outlet[0], HIGH);	
-	else
-		Timer1.attachInterrupt(triggerTriac, dimming[0]/100);
-#endif
-
-#if 0
-	for (int i=1; i<=DIM_RANGE; i++)
-	{
-		for (int j=0; j<nOutlet; j++)
-		{
-			if ((DIM_RANGE-i) == dimming[j])
-			{
-				// Turn on using Triac
-				digitalWrite(outlet[j], HIGH);
-				delayMicroseconds(10);        // Triac turning on delay
-				digitalWrite(outlet[j], LOW);
-
-				syslog("LED %d(%dpin) Turn ON at %d(%dus)",
-						j+1, outlet[j], (i-1), (i-1)*tDim);
-			}
-		}
-
-		// Turn off by just wait
-		delayMicroseconds(tDim);
-	}
-#endif
-#if 0
-	delayMicroseconds(65 * (128 - dim));  // Off cycle
-	//delayMicroseconds(33*(256-dim));  // Off cycle
-	digitalWrite(3, HIGH);       // triac firing
-	delayMicroseconds(10);     // triac On propogation delay
-	digitalWrite(3, LOW);        // triac Off
-#endif
 }
 
 /* NOTE: Do not use delay() in interrupt. It depends on interrupt itself.
- * Instead, use delayMicroseconds() that run busy loop(nop).
+ * Instead, use delayMicroseconds() that run busy loop(NOP).
  */
-void triggerTriac ()
+void triggerTriac()
 {
-	static unsigned int cnt = 0;
-	//Timer1.detachInterrupt();
-	//digitalWrite(outlet[0], HIGH);
-	//delayMicroseconds(10);  // triac On propogation delay
-	//digitalWrite(outlet[0], LOW);
+	static uint8_t cnt = 0;
+
 	if (crossing)
 	{
-		cnt++;
-		if (cnt++ == 4000/256)
+		if (cnt == (range-dimming[0]))
 		{
 			digitalWrite(outlet[0], HIGH);
-			delayMicroseconds(10);  // triac On propogation delay
+			delayMicroseconds(10);  // triac switching delay
 			digitalWrite(outlet[0], LOW);
-			//syslog("fire! cnt(%d)", cnt-1);
+
 			crossing = 0;
 			cnt = 0;
 		}
+		cnt++;
 	}
 }
 
@@ -240,45 +198,14 @@ void bleParser(const uint8_t* buffer, size_t size)
 
 void loop() 
 {
-	//static int thres1 = 0;
-	//static int thres2 = 10;
-	//dim = 124;
-	// available range: 10 ~ 124
 	//pktSerial.update();
-	 //for (int i=1; i <= 256; i+=1)
-//	 for (int i=thres1; i <= thres2; i++)
-//	 {
-//		 dim=i;
-//		 delay(1000);
-//	 }
-
-#if 0
-	 for (int i=thres2; i >= thres1; i--)
-	 {
-		 dim=i;
-		 delay(10);
-	 }
-#endif
-
-	// test code
-//	digitalWrite(outlet[0], HIGH);
-//	delayMicroseconds(10);        // Triac turning on delay
-//	digitalWrite(outlet[0], LOW);
-
-	 // re scale the value from hex to uSec 
-//	 dimming[0] = period - map(hexValue, 0, 256, 0, period);
-	 //dimming[0] = period - map(hexValue, 0, 256, 0, period);
 	 
-	 for (int i=0; i<=8300; i+=100)
-	 {
-		 dimming[0] = i;
-		 delay(30);
-	 }
-	 for (int i=8300; i>=0; i-=100)
-	 {
-		 dimming[0] = i;
-		 delay(30);
-	 }
+	// available range: 10 ~ 124
+	for (int i=10; i<=(range-10); i+=1)
+	{
+		dimming[0] = i;
+		delay(30);
+	}
 }
 
 void dumpPkt(const uint8_t* packet, size_t size)
